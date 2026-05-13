@@ -1,8 +1,4 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "5"
-# ///
 # DBTITLE 1,Install dependencies
 # MAGIC %pip install /Volumes/dev_catalog/shared/libs/openpyxl-3.1.5-py2.py3-none-any.whl /Volumes/dev_catalog/shared/libs/et_xmlfile-2.0.0-py3-none-any.whl -q
 
@@ -953,7 +949,13 @@ def sc_find_missing_pyspark(df, sc, sc_standard=None):
     # Narrow missing to cols in sc_dims
     # Pandas: to_use = list(set(missing.columns) & set(sc_dims))
     # Pandas: missing = missing[to_use].drop_duplicates().reset_index(drop=True)
-    to_use = list(set(missing.columns) & set(sc_dims))
+    # Exclude columns that cause spurious uniqueness in new pipeline:
+    # - ingest_ts/update_ts: ETL metadata not in old 46-col schema
+    # - list_code: bronze has actual DM_Acquisition_List values per gift,
+    #   old parquet had NaN for all → Pandas drop_duplicates collapsed them.
+    #   SC table key is (source_code, campaign_code, campaign_name, mail_date).
+    _dedup_exclude = {'ingest_ts', 'update_ts', 'list_code'}
+    to_use = list((set(missing.columns) & set(sc_dims)) - _dedup_exclude)
     missing = missing.select(*to_use).dropDuplicates()
     
     # Note: PySpark doesn't track duplicate column names at runtime

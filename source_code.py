@@ -24,7 +24,7 @@ def update_codes(df, client):
     """PySpark only for Databricks."""
     from pyspark.sql.functions import (
         col, when, concat, substring, lit, upper, rpad, length,
-        regexp_replace, sum as spark_sum, coalesce
+        regexp_replace, sum as spark_sum
     )
 
     if 'GiftAmount' not in df.columns:
@@ -67,42 +67,22 @@ def update_codes(df, client):
 
     if 'GiftAmount' in df.columns:
         # Gift/transaction path
+        #
+        # Use the CRM-provided SourceCode directly. Bronze stores the full PackageID,
+        # but CRM SourceCode already reflects the legacy 4-character PackageID truncation
+        # used by the old pipeline outputs. Reconstructing from components creates
+        # non-legacy codes such as DM0109APSNTSRXXX instead of DM0109APSNTXXX.
 
-        # Fix NAN contamination: bronze SourceCode was constructed with NULL
-        # PackageID/DM_Acquisition_List serialized as literal "nan".
-        # Strip the artifact — do NOT reconstruct from components (source system
-        # values may differ from component concatenation due to truncation/padding).
+        # Fix CRM nan artifacts before padding/uppercasing.
         df = df.withColumn('SourceCode',
             regexp_replace(col('SourceCode'), 'nan', ''))
 
         # Pad SourceCode to 14 with 'X' (don't truncate longer codes)
         df = df.withColumn('SourceCode', _ljust(col('SourceCode'), 14, 'X'))
 
-        # Rename DM_Acquisition_List -> ListCode
+        # Rename DM_Acquisition_List -> ListCode for downstream compatibility
         if 'DM_Acquisition_List' in df.columns:
             df = df.withColumnRenamed('DM_Acquisition_List', 'ListCode')
-
-        # Clean serialization artifacts in ListCode and PackageID:
-        # Source export serializes Python None/NaN as literal strings "None"/"nan".
-        # These must be treated as empty for SourceCode reconstruction.
-        if 'ListCode' in df.columns:
-            df = df.withColumn('ListCode',
-                when(col('ListCode').isin('None', 'nan', 'NaN', 'none'), lit(''))
-                .otherwise(coalesce(col('ListCode'), lit(''))))
-        if 'PackageID' in df.columns:
-            df = df.withColumn('PackageID',
-                when(col('PackageID').isin('None', 'nan', 'NaN', 'none'), lit(''))
-                .otherwise(coalesce(col('PackageID'), lit(''))))
-
-        # For AppealID ending with 'A': construct SourceCode from AppealID+PackageID+ListCode
-        # pandas: AppealID.ljust(7,'Y') + PackageID.ljust(4,'X') + ListCode.ljust(3,'X')
-        df = df.withColumn('SourceCode',
-            when(col('AppealID').endswith('A'),
-                 concat(
-                     _ljust(coalesce(col('AppealID').cast('string'), lit('')), 7, 'Y'),
-                     _ljust(coalesce(col('PackageID').cast('string'), lit('')), 4, 'X'),
-                     _ljust(coalesce(col('ListCode').cast('string'), lit('')), 3, 'X')))
-            .otherwise(col('SourceCode')))
 
     # _SourceCode: if CampaignCode ends with 'A', insert '___' at position 11; else append '___'
     df = df.withColumn('_SourceCode',
@@ -114,6 +94,13 @@ def update_codes(df, client):
     for c in ['ListCode', 'SourceCode']:
         if c in df.columns:
             df = df.withColumn(c, regexp_replace(col(c).cast('string'), r'\.0+$', ''))
+
+    # Uppercase SourceCode for SC table path ONLY.
+    # Old ETL: general update_codes() uppercased SC; CHOA_update_codes() was a no-op
+    # for gifts — so gift source codes preserved original case from CRM/parser.
+    if 'GiftAmount' not in df.columns:
+        if 'SourceCode' in df.columns:
+            df = df.withColumn('SourceCode', upper(col('SourceCode')))
 
     # Set PackageID/PackageCode to 'LAND' where SourceCode[7:11] == 'LAND'
     # PySpark: substring(col, 8, 4) (1-indexed) = pandas str[7:11] (0-indexed)
@@ -133,8 +120,9 @@ def add_filters(df, client):
     """PySpark only for Databricks."""
     from pyspark.sql.functions import col, when, lit
 
-    # Channel based on CampaignCode prefix + suffix patterns
-    df = df.withColumn('Channel',
+    # ReportChannel based on CampaignCode prefix + suffix patterns
+    # Old ETL: _CHOA_ReportChannelFilter → creates ReportChannel on SC table
+    df = df.withColumn('ReportChannel',
         when((col('CampaignCode').startswith('DM')) &
              (col('CampaignCode').endswith('R') | col('CampaignCode').endswith('E')),
              lit('Renewal'))
